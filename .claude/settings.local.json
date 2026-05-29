@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s -X POST http://localhost:5000/api/info -H \"Content-Type: application/json\" -d '{\"url\":\"https://www.youtube.com/watch?v=dQw4w9WgXcQ\"}')",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('Title:', d.get\\('title'\\)\\); print\\('Formats:', len\\(d.get\\('formats',[]\\)\\)\\)\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(json.dumps\\(d, indent=2\\)\\)\")"
+    ]
+  }
+}
