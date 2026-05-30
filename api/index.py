@@ -15,21 +15,24 @@ _YT_RE = re.compile(r'(?:https?://)?(?:www\.)?(?:youtube\.com|youtu\.be)/')
 
 # Standard quality options served when Cobalt handles YouTube
 _COBALT_FORMATS = [
+    {'format_id': 'cobalt_max',  'label': 'Max',        'type': 'video', 'ext': 'mp4', 'height': 9999, 'filesize': None, 'has_audio': True},
     {'format_id': 'cobalt_1080', 'label': '1080p',      'type': 'video', 'ext': 'mp4', 'height': 1080, 'filesize': None, 'has_audio': True},
-    {'format_id': 'cobalt_720',  'label': '720p',        'type': 'video', 'ext': 'mp4', 'height': 720,  'filesize': None, 'has_audio': True},
-    {'format_id': 'cobalt_480',  'label': '480p',        'type': 'video', 'ext': 'mp4', 'height': 480,  'filesize': None, 'has_audio': True},
-    {'format_id': 'cobalt_360',  'label': '360p',        'type': 'video', 'ext': 'mp4', 'height': 360,  'filesize': None, 'has_audio': True},
-    {'format_id': 'cobalt_audio','label': 'Audio Only',  'type': 'audio', 'ext': 'mp3', 'height': 0,    'filesize': None, 'has_audio': True},
+    {'format_id': 'cobalt_720',  'label': '720p',       'type': 'video', 'ext': 'mp4', 'height': 720,  'filesize': None, 'has_audio': True},
+    {'format_id': 'cobalt_360',  'label': '360p',       'type': 'video', 'ext': 'mp4', 'height': 360,  'filesize': None, 'has_audio': True},
+    {'format_id': 'cobalt_audio','label': 'Audio Only', 'type': 'audio', 'ext': 'mp3', 'height': 0,    'filesize': None, 'has_audio': True},
 ]
 
 _COBALT_QUALITY_MAP = {
+    'cobalt_max':   ('max',  'auto'),
     'cobalt_1080':  ('1080', 'auto'),
     'cobalt_720':   ('720',  'auto'),
-    'cobalt_480':   ('480',  'auto'),
     'cobalt_360':   ('360',  'auto'),
     'cobalt_audio': ('max',  'audio'),
     'best':         ('max',  'auto'),
 }
+
+# Heights to show for non-YouTube yt-dlp results
+_SHOW_HEIGHTS = {360, 720, 1080}
 
 
 def _is_youtube(url):
@@ -125,6 +128,7 @@ def get_info():
         formats = []
         seen_heights = set()
         seen_audio = False
+        best_video = None  # track highest-quality format for "Max"
 
         for fmt in reversed(info.get('formats') or ([info] if info.get('url') else [])):
             vcodec = fmt.get('vcodec', 'none')
@@ -134,17 +138,20 @@ def get_info():
             if not fmt.get('url'):
                 continue
 
-            if vcodec != 'none' and height and height not in seen_heights:
-                seen_heights.add(height)
-                formats.append({
-                    'format_id': fmt['format_id'],
-                    'label': f'{height}p',
-                    'type': 'video',
-                    'ext': ext if ext in ('mp4', 'webm', 'mov') else 'mp4',
-                    'height': height,
-                    'filesize': fmt.get('filesize') or fmt.get('filesize_approx'),
-                    'has_audio': acodec != 'none',
-                })
+            if vcodec != 'none' and height:
+                if best_video is None or height > best_video.get('height', 0):
+                    best_video = fmt
+                if height in _SHOW_HEIGHTS and height not in seen_heights:
+                    seen_heights.add(height)
+                    formats.append({
+                        'format_id': fmt['format_id'],
+                        'label': f'{height}p',
+                        'type': 'video',
+                        'ext': ext if ext in ('mp4', 'webm', 'mov') else 'mp4',
+                        'height': height,
+                        'filesize': fmt.get('filesize') or fmt.get('filesize_approx'),
+                        'has_audio': acodec != 'none',
+                    })
             elif vcodec == 'none' and acodec != 'none' and not seen_audio:
                 seen_audio = True
                 formats.append({
@@ -157,10 +164,29 @@ def get_info():
                     'has_audio': True,
                 })
 
+        # Prepend "Max" if best quality is higher than 1080p or not already in list
+        if best_video and best_video.get('format_id') not in {f['format_id'] for f in formats}:
+            bext = best_video.get('ext', 'mp4')
+            formats.insert(0, {
+                'format_id': best_video['format_id'],
+                'label': 'Max',
+                'type': 'video',
+                'ext': bext if bext in ('mp4', 'webm', 'mov') else 'mp4',
+                'height': best_video.get('height', 9999),
+                'filesize': best_video.get('filesize') or best_video.get('filesize_approx'),
+                'has_audio': best_video.get('acodec', 'none') != 'none',
+            })
+        elif best_video:
+            # Mark the best existing video format as "Max"
+            for f in formats:
+                if f['format_id'] == best_video['format_id']:
+                    f['label'] = 'Max'
+                    break
+
         formats.sort(key=lambda x: x['height'], reverse=True)
         if not formats:
-            formats.append({'format_id': 'best', 'label': 'Best Available',
-                            'type': 'video', 'ext': 'mp4', 'height': 0,
+            formats.append({'format_id': 'best', 'label': 'Max',
+                            'type': 'video', 'ext': 'mp4', 'height': 9999,
                             'filesize': None, 'has_audio': True})
 
         return jsonify({
@@ -239,15 +265,6 @@ def get_download_url():
         return jsonify({'error': str(e).replace('ERROR: ', '')}), 400
     except Exception as e:
         return jsonify({'error': f'Failed to get download URL: {e}'}), 500
-
-
-@app.route('/api/debug')
-def debug():
-    cobalt = _cobalt_api_url()
-    return jsonify({
-        'COBALT_API_URL_set': bool(cobalt),
-        'COBALT_API_URL_value': cobalt or None,
-    })
 
 
 if __name__ == '__main__':
