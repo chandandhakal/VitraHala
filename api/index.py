@@ -31,7 +31,7 @@ def get_info():
             'format': 'best[ext=mp4]/best',
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['android', 'ios', 'web'],
+                    'player_client': ['tv_embedded', 'web_creator', 'android', 'ios', 'web'],
                 }
             },
         }
@@ -138,7 +138,7 @@ def get_download_url():
             'format': fmt_selector,
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['android', 'ios', 'web'],
+                    'player_client': ['tv_embedded', 'web_creator', 'android', 'ios', 'web'],
                 }
             },
         }
