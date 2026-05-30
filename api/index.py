@@ -1,5 +1,7 @@
 import os
 import json
+import base64
+import tempfile
 import yt_dlp
 from flask import Flask, request, jsonify, render_template, redirect
 from flask_cors import CORS
@@ -7,6 +9,39 @@ from flask_cors import CORS
 template_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'templates'))
 app = Flask(__name__, template_folder=template_dir)
 CORS(app)
+
+
+def _get_cookies_file():
+    """Write cookies to a temp file from env vars and return its path, or None."""
+    # Prefer a pre-existing file path
+    path = os.environ.get('YOUTUBE_COOKIES_FILE')
+    if path and os.path.isfile(path):
+        return path
+    # Fall back to base64-encoded cookie content (safe for env vars)
+    b64 = os.environ.get('YOUTUBE_COOKIES_B64')
+    if b64:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.txt', mode='wb')
+        tmp.write(base64.b64decode(b64))
+        tmp.close()
+        return tmp.name
+    return None
+
+
+def _base_ydl_opts(fmt_selector):
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'format': fmt_selector,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['tv_embedded', 'web_creator', 'android', 'ios', 'web'],
+            }
+        },
+    }
+    cookies = _get_cookies_file()
+    if cookies:
+        opts['cookiefile'] = cookies
+    return opts
 
 
 @app.route('/')
@@ -23,23 +58,7 @@ def get_info():
         if not url:
             return jsonify({'error': 'URL is required'}), 400
 
-        # 'best[ext=mp4]/best' avoids ffmpeg-merge formats; gives us a processed info dict
-        # with all sibling formats still accessible via info['formats']
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'format': 'best[ext=mp4]/best',
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['tv_embedded', 'web_creator', 'android', 'ios', 'web'],
-                }
-            },
-        }
-
-        # Use a cookies file if provided (e.g. exported YouTube cookies for auth)
-        cookies_file = os.environ.get('YOUTUBE_COOKIES_FILE')
-        if cookies_file and os.path.isfile(cookies_file):
-            ydl_opts['cookiefile'] = cookies_file
+        ydl_opts = _base_ydl_opts('best[ext=mp4]/best')
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -132,20 +151,7 @@ def get_download_url():
         else:
             fmt_selector = f'{format_id}/best[ext=mp4]/best'
 
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'format': fmt_selector,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['tv_embedded', 'web_creator', 'android', 'ios', 'web'],
-                }
-            },
-        }
-
-        cookies_file = os.environ.get('YOUTUBE_COOKIES_FILE')
-        if cookies_file and os.path.isfile(cookies_file):
-            ydl_opts['cookiefile'] = cookies_file
+        ydl_opts = _base_ydl_opts(fmt_selector)
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
