@@ -186,5 +186,27 @@ def get_download_url():
         return jsonify({'error': f'Failed to get download URL: {str(e)}'}), 500
 
 
+@app.route('/api/debug-cookies')
+def debug_cookies():
+    b64 = os.environ.get('YOUTUBE_COOKIES_B64')
+    file_path = os.environ.get('YOUTUBE_COOKIES_FILE')
+    result = {
+        'YOUTUBE_COOKIES_B64_set': bool(b64),
+        'YOUTUBE_COOKIES_B64_length': len(b64) if b64 else 0,
+        'YOUTUBE_COOKIES_FILE_set': bool(file_path),
+        'cookies_file_resolved': None,
+        'cookies_file_size': None,
+        'decode_error': None,
+    }
+    try:
+        path = _get_cookies_file()
+        result['cookies_file_resolved'] = path
+        if path and os.path.isfile(path):
+            result['cookies_file_size'] = os.path.getsize(path)
+    except Exception as e:
+        result['decode_error'] = str(e)
+    return jsonify(result)
+
+
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
