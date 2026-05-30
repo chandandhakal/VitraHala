@@ -29,7 +29,17 @@ def get_info():
             'quiet': True,
             'no_warnings': True,
             'format': 'best[ext=mp4]/best',
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'ios', 'web'],
+                }
+            },
         }
+
+        # Use a cookies file if provided (e.g. exported YouTube cookies for auth)
+        cookies_file = os.environ.get('YOUTUBE_COOKIES_FILE')
+        if cookies_file and os.path.isfile(cookies_file):
+            ydl_opts['cookiefile'] = cookies_file
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -126,7 +136,16 @@ def get_download_url():
             'quiet': True,
             'no_warnings': True,
             'format': fmt_selector,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'ios', 'web'],
+                }
+            },
         }
+
+        cookies_file = os.environ.get('YOUTUBE_COOKIES_FILE')
+        if cookies_file and os.path.isfile(cookies_file):
+            ydl_opts['cookiefile'] = cookies_file
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
