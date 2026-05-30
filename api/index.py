@@ -241,5 +241,14 @@ def get_download_url():
         return jsonify({'error': f'Failed to get download URL: {e}'}), 500
 
 
+@app.route('/api/debug')
+def debug():
+    cobalt = _cobalt_api_url()
+    return jsonify({
+        'COBALT_API_URL_set': bool(cobalt),
+        'COBALT_API_URL_value': cobalt or None,
+    })
+
+
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
