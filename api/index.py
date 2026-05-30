@@ -1,48 +1,93 @@
 import os
+import re
 import json
-import base64
-import tempfile
+import urllib.request
+import urllib.parse
 import yt_dlp
-from flask import Flask, request, jsonify, render_template, redirect
+from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 
 template_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'templates'))
 app = Flask(__name__, template_folder=template_dir)
 CORS(app)
 
+_YT_RE = re.compile(r'(?:https?://)?(?:www\.)?(?:youtube\.com|youtu\.be)/')
 
-def _get_cookies_file():
-    """Write cookies to a temp file from env vars and return its path, or None."""
-    # Prefer a pre-existing file path
-    path = os.environ.get('YOUTUBE_COOKIES_FILE')
-    if path and os.path.isfile(path):
-        return path
-    # Fall back to base64-encoded cookie content (safe for env vars)
-    b64 = os.environ.get('YOUTUBE_COOKIES_B64')
-    if b64:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.txt', mode='wb')
-        tmp.write(base64.b64decode(b64))
-        tmp.close()
-        return tmp.name
-    return None
+# Standard quality options served when Cobalt handles YouTube
+_COBALT_FORMATS = [
+    {'format_id': 'cobalt_1080', 'label': '1080p',      'type': 'video', 'ext': 'mp4', 'height': 1080, 'filesize': None, 'has_audio': True},
+    {'format_id': 'cobalt_720',  'label': '720p',        'type': 'video', 'ext': 'mp4', 'height': 720,  'filesize': None, 'has_audio': True},
+    {'format_id': 'cobalt_480',  'label': '480p',        'type': 'video', 'ext': 'mp4', 'height': 480,  'filesize': None, 'has_audio': True},
+    {'format_id': 'cobalt_360',  'label': '360p',        'type': 'video', 'ext': 'mp4', 'height': 360,  'filesize': None, 'has_audio': True},
+    {'format_id': 'cobalt_audio','label': 'Audio Only',  'type': 'audio', 'ext': 'mp3', 'height': 0,    'filesize': None, 'has_audio': True},
+]
+
+_COBALT_QUALITY_MAP = {
+    'cobalt_1080':  ('1080', 'auto'),
+    'cobalt_720':   ('720',  'auto'),
+    'cobalt_480':   ('480',  'auto'),
+    'cobalt_360':   ('360',  'auto'),
+    'cobalt_audio': ('max',  'audio'),
+    'best':         ('max',  'auto'),
+}
 
 
-def _base_ydl_opts(fmt_selector):
-    opts = {
+def _is_youtube(url):
+    return bool(_YT_RE.match(url))
+
+
+def _cobalt_api_url():
+    return os.environ.get('COBALT_API_URL', '').rstrip('/')
+
+
+def _youtube_oembed(url):
+    """Fetch title/thumbnail from YouTube oEmbed — no bot detection."""
+    api = f'https://www.youtube.com/oembed?url={urllib.parse.quote(url)}&format=json'
+    req = urllib.request.Request(api, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+
+def _cobalt_download(url, quality='max', mode='auto'):
+    """Call the self-hosted Cobalt API and return its response dict."""
+    base = _cobalt_api_url()
+    payload = json.dumps({
+        'url': url,
+        'videoQuality': quality,
+        'downloadMode': mode,
+        'filenameStyle': 'pretty',
+    }).encode()
+
+    headers = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+    }
+    api_key = os.environ.get('COBALT_API_KEY', '')
+    if api_key:
+        headers['Authorization'] = f'Api-Key {api_key}'
+
+    req = urllib.request.Request(f'{base}/', data=payload, headers=headers, method='POST')
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def _ydl_opts(fmt_selector):
+    return {
         'quiet': True,
         'no_warnings': True,
         'format': fmt_selector,
         'extractor_args': {
             'youtube': {
-                'player_client': ['tv_embedded', 'web_creator', 'android', 'ios', 'web'],
+                # ios_downgraded is the current least-blocked unauthenticated client
+                'player_client': ['ios_downgraded', 'android_vr', 'web'],
             }
         },
     }
-    cookies = _get_cookies_file()
-    if cookies:
-        opts['cookiefile'] = cookies
-    return opts
 
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @app.route('/')
 def index():
@@ -58,107 +103,124 @@ def get_info():
         if not url:
             return jsonify({'error': 'URL is required'}), 400
 
-        ydl_opts = _base_ydl_opts('best[ext=mp4]/best')
+        # YouTube + Cobalt configured → use oEmbed for metadata, no bot risk
+        if _is_youtube(url) and _cobalt_api_url():
+            try:
+                meta = _youtube_oembed(url)
+                return jsonify({
+                    'title': meta.get('title', 'YouTube Video'),
+                    'thumbnail': meta.get('thumbnail_url'),
+                    'duration': None,
+                    'platform': 'youtube',
+                    'uploader': meta.get('author_name'),
+                    'formats': _COBALT_FORMATS,
+                })
+            except Exception:
+                pass  # fall through to yt-dlp
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        # All other platforms (and YouTube fallback) — use yt-dlp
+        with yt_dlp.YoutubeDL(_ydl_opts('best[ext=mp4]/best')) as ydl:
             info = ydl.extract_info(url, download=False)
 
         formats = []
         seen_heights = set()
         seen_audio = False
 
-        all_formats = info.get('formats') or ([info] if info.get('url') else [])
-
-        for fmt in reversed(all_formats):
+        for fmt in reversed(info.get('formats') or ([info] if info.get('url') else [])):
             vcodec = fmt.get('vcodec', 'none')
             acodec = fmt.get('acodec', 'none')
-            ext = fmt.get('ext', 'mp4')
+            ext    = fmt.get('ext', 'mp4')
             height = fmt.get('height')
-            fmt_url = fmt.get('url', '')
-
-            if not fmt_url:
+            if not fmt.get('url'):
                 continue
 
             if vcodec != 'none' and height and height not in seen_heights:
                 seen_heights.add(height)
-                filesize = fmt.get('filesize') or fmt.get('filesize_approx')
                 formats.append({
                     'format_id': fmt['format_id'],
                     'label': f'{height}p',
                     'type': 'video',
                     'ext': ext if ext in ('mp4', 'webm', 'mov') else 'mp4',
                     'height': height,
-                    'filesize': filesize,
+                    'filesize': fmt.get('filesize') or fmt.get('filesize_approx'),
                     'has_audio': acodec != 'none',
                 })
-
             elif vcodec == 'none' and acodec != 'none' and not seen_audio:
                 seen_audio = True
-                filesize = fmt.get('filesize') or fmt.get('filesize_approx')
                 formats.append({
                     'format_id': fmt['format_id'],
                     'label': 'Audio Only',
                     'type': 'audio',
                     'ext': 'm4a' if ext in ('m4a', 'mp4') else 'mp3',
                     'height': 0,
-                    'filesize': filesize,
+                    'filesize': fmt.get('filesize') or fmt.get('filesize_approx'),
                     'has_audio': True,
                 })
 
         formats.sort(key=lambda x: x['height'], reverse=True)
-
-        # Fallback if no formats parsed
         if not formats:
-            formats.append({
-                'format_id': 'best',
-                'label': 'Best Available',
-                'type': 'video',
-                'ext': 'mp4',
-                'height': 0,
-                'filesize': None,
-                'has_audio': True,
-            })
+            formats.append({'format_id': 'best', 'label': 'Best Available',
+                            'type': 'video', 'ext': 'mp4', 'height': 0,
+                            'filesize': None, 'has_audio': True})
 
         return jsonify({
-            'title': info.get('title', 'Unknown Video'),
-            'thumbnail': info.get('thumbnail'),
+            'title':    info.get('title', 'Unknown Video'),
+            'thumbnail':info.get('thumbnail'),
             'duration': info.get('duration'),
             'platform': info.get('extractor_key', '').lower(),
             'uploader': info.get('uploader'),
-            'formats': formats,
+            'formats':  formats,
         })
 
     except yt_dlp.utils.DownloadError as e:
-        msg = str(e).replace('ERROR: ', '')
-        return jsonify({'error': msg}), 400
+        return jsonify({'error': str(e).replace('ERROR: ', '')}), 400
     except Exception as e:
-        return jsonify({'error': f'Failed to fetch video info: {str(e)}'}), 500
+        return jsonify({'error': f'Failed to fetch video info: {e}'}), 500
 
 
 @app.route('/api/download-url', methods=['POST'])
 def get_download_url():
     try:
         data = request.get_json()
-        url = (data or {}).get('url', '').strip()
+        url       = (data or {}).get('url', '').strip()
         format_id = (data or {}).get('format_id', 'best')
 
         if not url:
             return jsonify({'error': 'URL is required'}), 400
 
-        # Use format that doesn't need ffmpeg merging (single-file)
-        if format_id == 'best':
-            fmt_selector = 'best[ext=mp4]/best'
-        else:
-            fmt_selector = f'{format_id}/best[ext=mp4]/best'
+        # YouTube + Cobalt configured → let Cobalt handle the download
+        if _is_youtube(url) and _cobalt_api_url():
+            quality, mode = _COBALT_QUALITY_MAP.get(format_id, ('max', 'auto'))
+            result = _cobalt_download(url, quality=quality, mode=mode)
 
-        ydl_opts = _base_ydl_opts(fmt_selector)
+            status = result.get('status')
+            if status in ('tunnel', 'redirect'):
+                ext = 'mp3' if mode == 'audio' else 'mp4'
+                return jsonify({
+                    'url':      result['url'],
+                    'filename': result.get('filename', f'video.{ext}'),
+                    'ext':      ext,
+                })
+            elif status == 'picker':
+                # Cobalt returned multiple items (e.g. playlist) — take the first
+                items = result.get('items', [])
+                if items:
+                    return jsonify({
+                        'url':      items[0]['url'],
+                        'filename': items[0].get('filename', 'video.mp4'),
+                        'ext':      'mp4',
+                    })
+            err_code = result.get('error', {}).get('code', 'unknown cobalt error')
+            return jsonify({'error': err_code}), 400
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        # Non-YouTube (or no Cobalt) — use yt-dlp
+        fmt_selector = ('best[ext=mp4]/best' if format_id == 'best'
+                        else f'{format_id}/best[ext=mp4]/best')
+
+        with yt_dlp.YoutubeDL(_ydl_opts(fmt_selector)) as ydl:
             info = ydl.extract_info(url, download=False)
 
         direct_url = info.get('url')
-
-        # Try to find URL in formats if not at top level
         if not direct_url:
             for fmt in info.get('formats', []):
                 if fmt.get('format_id') == format_id and fmt.get('url'):
@@ -168,44 +230,15 @@ def get_download_url():
         if not direct_url:
             return jsonify({'error': 'Could not extract direct download URL'}), 400
 
-        title = info.get('title', 'video')
-        # Sanitize filename
-        safe_title = ''.join(c for c in title if c.isalnum() or c in ' -_()[]').strip()[:80]
+        safe_title = ''.join(c for c in info.get('title', 'video')
+                             if c.isalnum() or c in ' -_()[]').strip()[:80]
         ext = info.get('ext', 'mp4')
-
-        return jsonify({
-            'url': direct_url,
-            'filename': f'{safe_title}.{ext}',
-            'ext': ext,
-        })
+        return jsonify({'url': direct_url, 'filename': f'{safe_title}.{ext}', 'ext': ext})
 
     except yt_dlp.utils.DownloadError as e:
-        msg = str(e).replace('ERROR: ', '')
-        return jsonify({'error': msg}), 400
+        return jsonify({'error': str(e).replace('ERROR: ', '')}), 400
     except Exception as e:
-        return jsonify({'error': f'Failed to get download URL: {str(e)}'}), 500
-
-
-@app.route('/api/debug-cookies')
-def debug_cookies():
-    b64 = os.environ.get('YOUTUBE_COOKIES_B64')
-    file_path = os.environ.get('YOUTUBE_COOKIES_FILE')
-    result = {
-        'YOUTUBE_COOKIES_B64_set': bool(b64),
-        'YOUTUBE_COOKIES_B64_length': len(b64) if b64 else 0,
-        'YOUTUBE_COOKIES_FILE_set': bool(file_path),
-        'cookies_file_resolved': None,
-        'cookies_file_size': None,
-        'decode_error': None,
-    }
-    try:
-        path = _get_cookies_file()
-        result['cookies_file_resolved'] = path
-        if path and os.path.isfile(path):
-            result['cookies_file_size'] = os.path.getsize(path)
-    except Exception as e:
-        result['decode_error'] = str(e)
-    return jsonify(result)
+        return jsonify({'error': f'Failed to get download URL: {e}'}), 500
 
 
 if __name__ == '__main__':
