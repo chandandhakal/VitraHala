@@ -31,8 +31,17 @@ _COBALT_QUALITY_MAP = {
     'best':         ('max',  'auto'),
 }
 
-# Heights to show for non-YouTube yt-dlp results
-_SHOW_HEIGHTS = {360, 720, 1080}
+# Combined (audio+video) format selectors keyed by synthetic format_id.
+# Each falls back progressively so portrait/unusual-resolution videos still work.
+_COMBINED = 'best[vcodec!=none][acodec!=none][ext=mp4]/best[vcodec!=none][acodec!=none]/best'
+_YDL_FORMAT_SELECTORS = {
+    'ydl_max':   _COMBINED,
+    'ydl_1080':  f'best[height<=1080][vcodec!=none][acodec!=none][ext=mp4]/best[width<=1080][vcodec!=none][acodec!=none][ext=mp4]/{_COMBINED}',
+    'ydl_720':   f'best[height<=720][vcodec!=none][acodec!=none][ext=mp4]/best[width<=720][vcodec!=none][acodec!=none][ext=mp4]/{_COMBINED}',
+    'ydl_360':   f'best[height<=360][vcodec!=none][acodec!=none][ext=mp4]/best[width<=360][vcodec!=none][acodec!=none][ext=mp4]/{_COMBINED}',
+    'ydl_audio': 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio',
+    'best':      _COMBINED,
+}
 
 
 def _is_youtube(url):
@@ -125,69 +134,24 @@ def get_info():
         with yt_dlp.YoutubeDL(_ydl_opts('best[ext=mp4]/best')) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        formats = []
-        seen_heights = set()
-        seen_audio = False
-        best_video = None  # track highest-quality format for "Max"
+        # Find the max height available (combined video+audio streams only)
+        max_height = 0
+        for fmt in info.get('formats') or ([info] if info.get('url') else []):
+            h = fmt.get('height') or 0
+            v = fmt.get('vcodec', 'none')
+            a = fmt.get('acodec', 'none')
+            if v not in ('none', None) and a not in ('none', None) and h > max_height:
+                max_height = h
 
-        for fmt in reversed(info.get('formats') or ([info] if info.get('url') else [])):
-            vcodec = fmt.get('vcodec', 'none')
-            acodec = fmt.get('acodec', 'none')
-            ext    = fmt.get('ext', 'mp4')
-            height = fmt.get('height')
-            if not fmt.get('url'):
-                continue
-
-            if vcodec != 'none' and height:
-                if best_video is None or height > best_video.get('height', 0):
-                    best_video = fmt
-                if height in _SHOW_HEIGHTS and height not in seen_heights:
-                    seen_heights.add(height)
-                    formats.append({
-                        'format_id': fmt['format_id'],
-                        'label': f'{height}p',
-                        'type': 'video',
-                        'ext': ext if ext in ('mp4', 'webm', 'mov') else 'mp4',
-                        'height': height,
-                        'filesize': fmt.get('filesize') or fmt.get('filesize_approx'),
-                        'has_audio': acodec != 'none',
-                    })
-            elif vcodec == 'none' and acodec != 'none' and not seen_audio:
-                seen_audio = True
-                formats.append({
-                    'format_id': fmt['format_id'],
-                    'label': 'Audio Only',
-                    'type': 'audio',
-                    'ext': 'm4a' if ext in ('m4a', 'mp4') else 'mp3',
-                    'height': 0,
-                    'filesize': fmt.get('filesize') or fmt.get('filesize_approx'),
-                    'has_audio': True,
-                })
-
-        # Prepend "Max" if best quality is higher than 1080p or not already in list
-        if best_video and best_video.get('format_id') not in {f['format_id'] for f in formats}:
-            bext = best_video.get('ext', 'mp4')
-            formats.insert(0, {
-                'format_id': best_video['format_id'],
-                'label': 'Max',
-                'type': 'video',
-                'ext': bext if bext in ('mp4', 'webm', 'mov') else 'mp4',
-                'height': best_video.get('height', 9999),
-                'filesize': best_video.get('filesize') or best_video.get('filesize_approx'),
-                'has_audio': best_video.get('acodec', 'none') != 'none',
-            })
-        elif best_video:
-            # Mark the best existing video format as "Max"
-            for f in formats:
-                if f['format_id'] == best_video['format_id']:
-                    f['label'] = 'Max'
-                    break
-
-        formats.sort(key=lambda x: x['height'], reverse=True)
-        if not formats:
-            formats.append({'format_id': 'best', 'label': 'Max',
-                            'type': 'video', 'ext': 'mp4', 'height': 9999,
-                            'filesize': None, 'has_audio': True})
+        # Build fixed quality options based on what's actually available
+        formats = [{'format_id': 'ydl_max', 'label': 'Max', 'type': 'video',
+                    'ext': 'mp4', 'height': max_height or 9999, 'filesize': None, 'has_audio': True}]
+        for h, fid in [(1080, 'ydl_1080'), (720, 'ydl_720'), (360, 'ydl_360')]:
+            if max_height >= h:
+                formats.append({'format_id': fid, 'label': f'{h}p', 'type': 'video',
+                                'ext': 'mp4', 'height': h, 'filesize': None, 'has_audio': True})
+        formats.append({'format_id': 'ydl_audio', 'label': 'Audio Only', 'type': 'audio',
+                        'ext': 'm4a', 'height': 0, 'filesize': None, 'has_audio': True})
 
         return jsonify({
             'title':    info.get('title', 'Unknown Video'),
@@ -239,9 +203,8 @@ def get_download_url():
             err_code = result.get('error', {}).get('code', 'unknown cobalt error')
             return jsonify({'error': err_code}), 400
 
-        # Non-YouTube (or no Cobalt) — use yt-dlp
-        fmt_selector = ('best[ext=mp4]/best' if format_id == 'best'
-                        else f'{format_id}/best[ext=mp4]/best')
+        # Non-YouTube (or no Cobalt) — use yt-dlp with height-based combined selectors
+        fmt_selector = _YDL_FORMAT_SELECTORS.get(format_id, _YDL_FORMAT_SELECTORS['best'])
 
         with yt_dlp.YoutubeDL(_ydl_opts(fmt_selector)) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -249,7 +212,7 @@ def get_download_url():
         direct_url = info.get('url')
         if not direct_url:
             for fmt in info.get('formats', []):
-                if fmt.get('format_id') == format_id and fmt.get('url'):
+                if fmt.get('url'):
                     direct_url = fmt['url']
                     break
 
