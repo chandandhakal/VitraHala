@@ -87,8 +87,15 @@ def _safe_title(s, maxlen=80):
     return re.sub(r'[^\w\s\-()]', '', s or 'video').strip()[:maxlen]
 
 
+def _cobalt_api_urls():
+    """COBALT_API_URL may be a comma-separated list of instances, tried in order."""
+    raw = os.environ.get('COBALT_API_URL', '')
+    return [u.strip().rstrip('/') for u in raw.split(',') if u.strip()]
+
+
 def _cobalt_api_url():
-    return os.environ.get('COBALT_API_URL', '').rstrip('/')
+    urls = _cobalt_api_urls()
+    return urls[0] if urls else ''
 
 
 def _detect_platform(url):
@@ -191,24 +198,92 @@ def _youtube_oembed(url):
     return _http_get(api, {'User-Agent': 'Mozilla/5.0'}, timeout=10)
 
 
+_YT_ID_RE = re.compile(r'(?:v=|youtu\.be/|shorts/|embed/|live/)([A-Za-z0-9_-]{11})')
+
+
+def _yt_fallback_apis():
+    raw = os.environ.get('YT_FALLBACK_APIS', 'https://api.piped.private.coffee')
+    return [u.strip().rstrip('/') for u in raw.split(',') if u.strip()]
+
+
+def _youtube_piped_resolve(url, format_id):
+    """Last-resort YouTube resolver via Piped instances. Their stream URLs are
+    proxied through the instance, so they work for the end user's browser
+    (raw googlevideo URLs are IP-locked to whoever extracted them)."""
+    m = _YT_ID_RE.search(url)
+    if not m:
+        raise ValueError('Could not extract YouTube video id')
+    vid = m.group(1)
+    quality, mode = _fmt_quality(format_id)
+    target = 9999 if quality == 'max' else int(quality)
+
+    last_err = None
+    for base in _yt_fallback_apis():
+        try:
+            d = _http_get(f'{base}/streams/{vid}', {'User-Agent': 'Mozilla/5.0'}, timeout=20)
+        except Exception as e:
+            last_err = e
+            continue
+        title = _safe_title(d.get('title') or f'youtube_{vid}')
+
+        if mode == 'audio':
+            auds = sorted([s for s in d.get('audioStreams', []) if s.get('url')],
+                          key=lambda s: (s.get('format') == 'M4A', s.get('bitrate') or 0),
+                          reverse=True)
+            if auds:
+                return {'url': auds[0]['url'], 'filename': f'{title}.m4a', 'ext': 'm4a'}
+            # no audio streams — fall through to lowest combined video (has audio)
+
+        def height(s):
+            qm = re.match(r'(\d+)p', s.get('quality') or '')
+            return int(qm.group(1)) if qm else 720  # 'LBRY' mirror etc.
+
+        combined = [s for s in d.get('videoStreams', [])
+                    if s.get('url') and not s.get('videoOnly')
+                    and 'mp4' in (s.get('mimeType') or '')]
+        if combined:
+            if mode == 'audio':
+                best = min(combined, key=height)
+            else:
+                within = [s for s in combined if height(s) <= target] or combined
+                best = max(within, key=height)
+            return {'url': best['url'], 'filename': f'{title}.mp4', 'ext': 'mp4'}
+        last_err = ValueError('No usable streams from fallback server')
+    raise last_err or ValueError('No YouTube fallback servers configured')
+
+
 def _cobalt_download(url, quality='max', mode='auto'):
-    base = _cobalt_api_url()
     payload = json.dumps({'url': url, 'videoQuality': quality,
                           'downloadMode': mode, 'filenameStyle': 'pretty'}).encode()
     headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
     api_key = os.environ.get('COBALT_API_KEY', '')
     if api_key:
         headers['Authorization'] = f'Api-Key {api_key}'
-    req = urllib.request.Request(f'{base}/', data=payload, headers=headers, method='POST')
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        # Cobalt reports errors as HTTP 4xx with a JSON body ({status: error, error: {code}})
+
+    last = None
+    for base in _cobalt_api_urls():
+        req = urllib.request.Request(f'{base}/', data=payload, headers=headers, method='POST')
         try:
-            return json.loads(e.read())
-        except Exception:
-            raise e
+            with urllib.request.urlopen(req, timeout=30) as r:
+                result = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            # Cobalt reports errors as HTTP 4xx with a JSON body ({status: error, error: {code}})
+            try:
+                result = json.loads(e.read())
+            except Exception:
+                last = e
+                continue
+        except Exception as e:
+            last = e
+            continue
+        if result.get('status') != 'error':
+            return result
+        last = result  # instance answered but couldn't process — try the next one
+    if isinstance(last, dict):
+        return last
+    if last:
+        raise last
+    raise ValueError('No Cobalt API configured')
 
 
 def _cobalt_error_text(code):
@@ -225,6 +300,9 @@ def _cobalt_error_text(code):
         'error.api.content.post.unavailable':    'This post is unavailable — it may be private or deleted.',
         'error.api.content.post.private':        'This post is private.',
         'error.api.rate_exceeded':               'Too many requests — wait a moment and try again.',
+        'error.api.youtube.login':               'YouTube is temporarily blocking the download server — try again in a few minutes.',
+        'error.api.youtube.token_expired':       'YouTube is temporarily blocking the download server — try again in a few minutes.',
+        'error.api.youtube.no_session_tokens':   'YouTube is temporarily blocking the download server — try again in a few minutes.',
     }
     if code in nice:
         return nice[code]
@@ -954,6 +1032,10 @@ def get_download_url():
                 return jsonify(_cobalt_resolve(url, format_id))
             except Exception as e:
                 if platform == 'youtube':
+                    try:
+                        return jsonify(_youtube_piped_resolve(url, format_id))
+                    except Exception:
+                        pass
                     return jsonify({'error': str(e)}), 400
                 if platform in dl_handlers and not handler_failed:
                     # Cobalt failed before the custom handler got a chance — try it now
