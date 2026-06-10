@@ -198,8 +198,15 @@ def _cobalt_download(url, quality='max', mode='auto'):
     if api_key:
         headers['Authorization'] = f'Api-Key {api_key}'
     req = urllib.request.Request(f'{base}/', data=payload, headers=headers, method='POST')
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        # Cobalt reports errors as HTTP 4xx with a JSON body ({status: error, error: {code}})
+        try:
+            return json.loads(e.read())
+        except Exception:
+            raise e
 
 
 def _cobalt_error_text(code):
@@ -768,17 +775,19 @@ def get_info():
             'dailymotion': _dailymotion_info,
             'instagram':   _instagram_info,
         }
+        handler_failed = False
         if platform in handlers:
             try:
                 info = handlers[platform](url)
                 return jsonify({k: v for k, v in info.items() if not k.startswith('_')})
             except Exception as e:
+                handler_failed = True
                 # Preserve custom error when our message is more actionable than yt-dlp's.
                 if platform in ('instagram', 'twitter', 'reddit'):
                     custom_error = str(e)
 
         # Cobalt for IP-blocked platforms, or when the custom handler just failed
-        if cobalt_ok and (platform in _COBALT_FIRST or custom_error):
+        if cobalt_ok and (platform in _COBALT_FIRST or handler_failed):
             try:
                 return jsonify(_cobalt_generic_info(url, platform))
             except Exception:
@@ -855,24 +864,39 @@ def get_download_url():
             'dailymotion': _dailymotion_download_url,
             'instagram':   _instagram_download_url,
         }
-        if platform in dl_handlers and (format_id.split('_')[0] in (
-                'tikwm', 'tw', 'reddit', 'dm', 'ig') or format_id == 'dm_hls'):
+        use_custom = platform in dl_handlers and (format_id.split('_')[0] in (
+            'tikwm', 'tw', 'reddit', 'dm', 'ig') or format_id == 'dm_hls')
+        # Instagram og-scraped CDN URLs are signed for the server's request and
+        # 403 for the end user; HLS manifests aren't a usable download. Cobalt
+        # tunnels a real MP4 for both — prefer it when available.
+        if cobalt_ok and (platform == 'instagram' or format_id == 'dm_hls'):
+            use_custom = False
+
+        handler_failed = False
+        if use_custom:
             try:
                 return jsonify(dl_handlers[platform](url, format_id))
             except Exception as e:
+                handler_failed = True
                 if platform in ('instagram', 'twitter', 'reddit'):
                     custom_error = str(e)
                 # fall through to Cobalt / yt-dlp
 
         # Cobalt: IP-blocked platforms (incl. YouTube), cobalt_* formats,
         # or any supported platform whose custom handler just failed
-        if cobalt_ok and (platform in _COBALT_FIRST
-                          or format_id.startswith('cobalt_') or custom_error):
+        if cobalt_ok and (platform in _COBALT_FIRST or format_id.startswith('cobalt_')
+                          or format_id == 'dm_hls' or handler_failed):
             try:
                 return jsonify(_cobalt_resolve(url, format_id))
             except Exception as e:
                 if platform == 'youtube':
                     return jsonify({'error': str(e)}), 400
+                if platform in dl_handlers and not handler_failed:
+                    # Cobalt failed before the custom handler got a chance — try it now
+                    try:
+                        return jsonify(dl_handlers[platform](url, format_id))
+                    except Exception:
+                        pass
                 custom_error = custom_error or str(e)
                 # fall through to yt-dlp
 
