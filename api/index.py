@@ -87,10 +87,22 @@ def _safe_title(s, maxlen=80):
     return re.sub(r'[^\w\s\-()]', '', s or 'video').strip()[:maxlen]
 
 
-def _cobalt_api_urls():
+def _cobalt_own_apis():
     """COBALT_API_URL may be a comma-separated list of instances, tried in order."""
     raw = os.environ.get('COBALT_API_URL', '')
     return [u.strip().rstrip('/') for u in raw.split(',') if u.strip()]
+
+
+def _cobalt_fallback_apis():
+    """Public keyless community instances, tried after our own (override or
+    disable via COBALT_FALLBACK_APIS)."""
+    raw = os.environ.get('COBALT_FALLBACK_APIS', 'https://api.co.rooot.gay')
+    return [u.strip().rstrip('/') for u in raw.split(',') if u.strip()]
+
+
+def _cobalt_api_urls():
+    own = _cobalt_own_apis()
+    return own + [u for u in _cobalt_fallback_apis() if u not in own]
 
 
 def _cobalt_api_url():
@@ -255,13 +267,14 @@ def _youtube_piped_resolve(url, format_id):
 def _cobalt_download(url, quality='max', mode='auto'):
     payload = json.dumps({'url': url, 'videoQuality': quality,
                           'downloadMode': mode, 'filenameStyle': 'pretty'}).encode()
-    headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
     api_key = os.environ.get('COBALT_API_KEY', '')
-    if api_key:
-        headers['Authorization'] = f'Api-Key {api_key}'
+    own = set(_cobalt_own_apis())
 
     last = None
     for base in _cobalt_api_urls():
+        headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+        if api_key and base in own:  # never send our key to public fallback instances
+            headers['Authorization'] = f'Api-Key {api_key}'
         req = urllib.request.Request(f'{base}/', data=payload, headers=headers, method='POST')
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
@@ -883,6 +896,42 @@ def _ydl_opts(fmt_selector, url=''):
 @app.route('/')
 def index():
     return render_template('index.html')
+
+
+@app.route('/api/diag', methods=['POST'])
+def diag():
+    """Temporary: per-backend reachability report for a URL, as seen from this server."""
+    url = (request.get_json() or {}).get('url', 'https://www.youtube.com/watch?v=dQw4w9WgXcQ')
+    report = {}
+    payload = json.dumps({'url': url, 'videoQuality': '720', 'downloadMode': 'auto',
+                          'filenameStyle': 'pretty'}).encode()
+    api_key = os.environ.get('COBALT_API_KEY', '')
+    own = set(_cobalt_own_apis())
+    for base in _cobalt_api_urls():
+        headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+        if api_key and base in own:
+            headers['Authorization'] = f'Api-Key {api_key}'
+        try:
+            req = urllib.request.Request(f'{base}/', data=payload, headers=headers, method='POST')
+            try:
+                with urllib.request.urlopen(req, timeout=25) as r:
+                    d = json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                d = json.loads(e.read())
+            report[base] = d.get('status') + ' ' + (d.get('error') or {}).get('code', '')
+        except Exception as e:
+            report[base] = f'unreachable: {type(e).__name__}'
+    for base in _yt_fallback_apis():
+        m = _YT_ID_RE.search(url)
+        if not m:
+            continue
+        try:
+            d = _http_get(f'{base}/streams/{m.group(1)}', {'User-Agent': 'Mozilla/5.0'}, timeout=20)
+            n = len([s for s in d.get('videoStreams', []) if not s.get('videoOnly')])
+            report[base] = f'ok, {n} combined streams'
+        except Exception as e:
+            report[base] = f'unreachable: {type(e).__name__} {getattr(e, "code", "")}'
+    return jsonify(report)
 
 
 @app.route('/api/info', methods=['POST'])
