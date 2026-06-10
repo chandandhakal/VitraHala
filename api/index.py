@@ -218,10 +218,34 @@ def _yt_fallback_apis():
     return [u.strip().rstrip('/') for u in raw.split(',') if u.strip()]
 
 
-def _youtube_piped_resolve(url, format_id):
-    """Last-resort YouTube resolver via Piped instances. Their stream URLs are
-    proxied through the instance, so they work for the end user's browser
-    (raw googlevideo URLs are IP-locked to whoever extracted them)."""
+_YT_DYN = {'ts': 0.0, 'apis': []}
+
+
+def _yt_dynamic_apis():
+    """Discover live Piped/Invidious APIs from their official directories (cached)."""
+    if _YT_DYN['apis'] and time.time() - _YT_DYN['ts'] < 600:
+        return _YT_DYN['apis']
+    ua = {'User-Agent': 'Mozilla/5.0'}
+    apis = []
+    try:
+        pl = _http_get('https://piped-instances.kavin.rocks/', ua, timeout=10)
+        apis += [('piped', p['api_url'].rstrip('/')) for p in pl if p.get('api_url')]
+    except Exception:
+        pass
+    try:
+        inst = _http_get('https://api.invidious.io/instances.json?sort_by=health', ua, timeout=10)
+        apis += [('invidious', f'https://{name}') for name, meta in inst
+                 if isinstance(meta, dict) and meta.get('api') and meta.get('type') == 'https']
+    except Exception:
+        pass
+    _YT_DYN.update(ts=time.time(), apis=apis)
+    return apis
+
+
+def _youtube_alt_resolve(url, format_id):
+    """Last-resort YouTube resolver via Piped/Invidious instances. Their stream
+    URLs are proxied through the instance, so they work for the end user's
+    browser (raw googlevideo URLs are IP-locked to whoever extracted them)."""
     m = _YT_ID_RE.search(url)
     if not m:
         raise ValueError('Could not extract YouTube video id')
@@ -229,68 +253,103 @@ def _youtube_piped_resolve(url, format_id):
     quality, mode = _fmt_quality(format_id)
     target = 9999 if quality == 'max' else int(quality)
 
+    sources = [('piped', b) for b in _yt_fallback_apis()]
+    sources += [s for s in _yt_dynamic_apis() if s not in sources]
+
+    def height(label):
+        qm = re.match(r'(\d+)p', label or '')
+        return int(qm.group(1)) if qm else 720  # 'LBRY' mirror etc.
+
+    def pick(combined, key):
+        if mode == 'audio':
+            return min(combined, key=key)
+        within = [s for s in combined if key(s) <= target] or combined
+        return max(within, key=key)
+
     last_err = None
-    for base in _yt_fallback_apis():
+    for kind, base in sources[:8]:
         try:
-            d = _http_get(f'{base}/streams/{vid}', {'User-Agent': 'Mozilla/5.0'}, timeout=20)
+            if kind == 'piped':
+                d = _http_get(f'{base}/streams/{vid}', {'User-Agent': 'Mozilla/5.0'}, timeout=20)
+                title = _safe_title(d.get('title') or f'youtube_{vid}')
+                if mode == 'audio':
+                    auds = sorted([s for s in d.get('audioStreams', []) if s.get('url')],
+                                  key=lambda s: (s.get('format') == 'M4A', s.get('bitrate') or 0),
+                                  reverse=True)
+                    if auds:
+                        return {'url': auds[0]['url'], 'filename': f'{title}.m4a', 'ext': 'm4a'}
+                combined = [s for s in d.get('videoStreams', [])
+                            if s.get('url') and not s.get('videoOnly')
+                            and 'mp4' in (s.get('mimeType') or '')]
+                if combined:
+                    best = pick(combined, lambda s: height(s.get('quality')))
+                    return {'url': best['url'], 'filename': f'{title}.mp4', 'ext': 'mp4'}
+            else:  # invidious — local=true returns instance-proxied URLs
+                d = _http_get(f'{base}/api/v1/videos/{vid}?local=true',
+                              {'User-Agent': 'Mozilla/5.0'}, timeout=20)
+                title = _safe_title(d.get('title') or f'youtube_{vid}')
+
+                def absolute(u):
+                    u = base + u if u.startswith('/') else u
+                    return re.sub(r'^http://', 'https://', u)  # avoid mixed-content blocks
+
+                if mode == 'audio':
+                    auds = sorted([s for s in d.get('adaptiveFormats', [])
+                                   if s.get('url') and (s.get('type') or '').startswith('audio/mp4')],
+                                  key=lambda s: int(s.get('bitrate') or 0), reverse=True)
+                    if auds:
+                        return {'url': absolute(auds[0]['url']),
+                                'filename': f'{title}.m4a', 'ext': 'm4a'}
+                combined = [s for s in d.get('formatStreams', []) if s.get('url')]
+                if combined:
+                    best = pick(combined, lambda s: height(s.get('qualityLabel')))
+                    return {'url': absolute(best['url']),
+                            'filename': f'{title}.mp4', 'ext': 'mp4'}
+            last_err = ValueError('No usable streams from fallback server')
         except Exception as e:
             last_err = e
-            continue
-        title = _safe_title(d.get('title') or f'youtube_{vid}')
-
-        if mode == 'audio':
-            auds = sorted([s for s in d.get('audioStreams', []) if s.get('url')],
-                          key=lambda s: (s.get('format') == 'M4A', s.get('bitrate') or 0),
-                          reverse=True)
-            if auds:
-                return {'url': auds[0]['url'], 'filename': f'{title}.m4a', 'ext': 'm4a'}
-            # no audio streams — fall through to lowest combined video (has audio)
-
-        def height(s):
-            qm = re.match(r'(\d+)p', s.get('quality') or '')
-            return int(qm.group(1)) if qm else 720  # 'LBRY' mirror etc.
-
-        combined = [s for s in d.get('videoStreams', [])
-                    if s.get('url') and not s.get('videoOnly')
-                    and 'mp4' in (s.get('mimeType') or '')]
-        if combined:
-            if mode == 'audio':
-                best = min(combined, key=height)
-            else:
-                within = [s for s in combined if height(s) <= target] or combined
-                best = max(within, key=height)
-            return {'url': best['url'], 'filename': f'{title}.mp4', 'ext': 'mp4'}
-        last_err = ValueError('No usable streams from fallback server')
     raise last_err or ValueError('No YouTube fallback servers configured')
 
 
 def _cobalt_download(url, quality='max', mode='auto'):
-    payload = json.dumps({'url': url, 'videoQuality': quality,
-                          'downloadMode': mode, 'filenameStyle': 'pretty'}).encode()
+    body = {'url': url, 'videoQuality': quality,
+            'downloadMode': mode, 'filenameStyle': 'pretty'}
     api_key = os.environ.get('COBALT_API_KEY', '')
     own = set(_cobalt_own_apis())
 
-    last = None
-    for base in _cobalt_api_urls():
-        headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+    def _post(base, payload):
+        headers = {'Content-Type': 'application/json', 'Accept': 'application/json',
+                   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                                 'AppleWebKit/537.36 Chrome/125.0 Safari/537.36'}
         if api_key and base in own:  # never send our key to public fallback instances
             headers['Authorization'] = f'Api-Key {api_key}'
-        req = urllib.request.Request(f'{base}/', data=payload, headers=headers, method='POST')
+        req = urllib.request.Request(f'{base}/', data=json.dumps(payload).encode(),
+                                     headers=headers, method='POST')
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
-                result = json.loads(r.read())
+                return json.loads(r.read())
         except urllib.error.HTTPError as e:
             # Cobalt reports errors as HTTP 4xx with a JSON body ({status: error, error: {code}})
-            try:
-                result = json.loads(e.read())
-            except Exception:
-                last = e
-                continue
+            return json.loads(e.read())
+
+    last = None
+    for base in _cobalt_api_urls():
+        try:
+            result = _post(base, body)
         except Exception as e:
             last = e
             continue
         if result.get('status') != 'error':
             return result
+        code = (result.get('error') or {}).get('code', '')
+        if 'youtube' in code:
+            # the HLS client path often evades YouTube's login wall — retry once
+            try:
+                retry = _post(base, {**body, 'youtubeHLS': True})
+                if retry.get('status') != 'error':
+                    return retry
+            except Exception:
+                pass
         last = result  # instance answered but couldn't process — try the next one
     if isinstance(last, dict):
         return last
@@ -1046,7 +1105,7 @@ def get_download_url():
             except Exception as e:
                 if platform == 'youtube':
                     try:
-                        return jsonify(_youtube_piped_resolve(url, format_id))
+                        return jsonify(_youtube_alt_resolve(url, format_id))
                     except Exception:
                         pass
                     return jsonify({'error': str(e)}), 400
