@@ -2,6 +2,8 @@ import os
 import re
 import json
 import math
+import time
+import base64
 import urllib.request
 import urllib.parse
 import yt_dlp
@@ -436,20 +438,82 @@ def _twitter_download_url(url, format_id):
 # Reddit — via public JSON API + v.redd.it CDN (no auth needed)
 # ---------------------------------------------------------------------------
 
+_REDDIT_UA = 'web:vitrahala:v1.0 (video downloader)'
+_REDDIT_TOKEN = {'token': None, 'expires': 0}
+
+
+def _reddit_token():
+    """App-only OAuth token. Needs REDDIT_CLIENT_ID (+ optional secret) env vars."""
+    cid = os.environ.get('REDDIT_CLIENT_ID', '')
+    if not cid:
+        return None
+    if _REDDIT_TOKEN['token'] and time.time() < _REDDIT_TOKEN['expires'] - 60:
+        return _REDDIT_TOKEN['token']
+    secret = os.environ.get('REDDIT_CLIENT_SECRET', '')
+    if secret:
+        body = urllib.parse.urlencode({'grant_type': 'client_credentials'})
+    else:
+        body = urllib.parse.urlencode({
+            'grant_type': 'https://oauth.reddit.com/grants/installed_client',
+            'device_id': 'vitrahala-device-000001'})
+    auth = base64.b64encode(f'{cid}:{secret}'.encode()).decode()
+    req = urllib.request.Request(
+        'https://www.reddit.com/api/v1/access_token', data=body.encode(),
+        headers={'Authorization': f'Basic {auth}', 'User-Agent': _REDDIT_UA,
+                 'Content-Type': 'application/x-www-form-urlencoded'}, method='POST')
+    with urllib.request.urlopen(req, timeout=15) as r:
+        d = json.loads(r.read())
+    _REDDIT_TOKEN['token'] = d.get('access_token')
+    _REDDIT_TOKEN['expires'] = time.time() + int(d.get('expires_in', 3600))
+    return _REDDIT_TOKEN['token']
+
+
+def _reddit_post_id(url):
+    m = re.search(r'/comments/([a-z0-9]+)', url)
+    if not m and 'v.redd.it' not in url:
+        m = re.search(r'redd\.it/([a-z0-9]+)', url)
+    return m.group(1) if m else None
+
+
 def _reddit_fetch(url):
     clean = re.sub(r'\?.*$', '', url.rstrip('/'))
+    data = None
+    not_found = False
+
+    # 1) public JSON endpoint (works when Reddit isn't blocking the IP)
     try:
         data = _http_get(clean + '/.json?raw_json=1&limit=1', {
             'User-Agent': 'Mozilla/5.0 (compatible; VideoFetcher/1.0)',
             'Accept': 'application/json',
-        }, timeout=15)
+        }, timeout=12)
     except Exception as e:
-        msg = str(e)
-        code = getattr(e, 'code', None)
-        if code == 404 or '404' in msg:
-            raise ValueError('Reddit post not found — the URL may be deleted or private.')
-        # Cloudflare resets the connection (403/connection reset) for automated requests
-        raise ValueError('Reddit is blocking automated access. Open the Reddit URL in your browser to watch the video.')
+        not_found = getattr(e, 'code', None) == 404 or '404' in str(e)
+
+    # 2) official OAuth API — not behind the Cloudflare wall that blocks
+    #    datacenter IPs, but needs app credentials
+    if data is None and not not_found:
+        pid = _reddit_post_id(url)
+        if pid:
+            try:
+                token = _reddit_token()
+                if token:
+                    data = _http_get(
+                        f'https://oauth.reddit.com/comments/{pid}?raw_json=1&limit=1',
+                        {'Authorization': f'Bearer {token}', 'User-Agent': _REDDIT_UA,
+                         'Accept': 'application/json'}, timeout=15)
+            except Exception as e:
+                not_found = getattr(e, 'code', None) == 404
+
+    if not_found:
+        raise ValueError('Reddit post not found — the URL may be deleted or private.')
+    if data is None:
+        if os.environ.get('REDDIT_CLIENT_ID'):
+            raise ValueError('Reddit is blocking automated access and the Reddit API '
+                             'request failed — check the REDDIT_CLIENT_ID / '
+                             'REDDIT_CLIENT_SECRET credentials.')
+        raise ValueError('Reddit is blocking automated access. Set the REDDIT_CLIENT_ID '
+                         'and REDDIT_CLIENT_SECRET env vars (free app from '
+                         'reddit.com/prefs/apps) to enable Reddit downloads.')
     post = data[0]['data']['children'][0]['data']
 
     def _get_rv(p):
