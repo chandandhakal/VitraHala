@@ -934,6 +934,13 @@ def get_download_url():
         if not direct_url:
             return jsonify({'error': 'Could not extract direct download URL'}), 400
 
+        # HLS manifests aren't a usable download file — let Cobalt remux to MP4
+        if cobalt_ok and '.m3u8' in direct_url.split('?')[0]:
+            try:
+                return jsonify(_cobalt_resolve(url, format_id))
+            except Exception:
+                pass  # fall back to serving the manifest URL
+
         safe = _safe_title(info.get('title', 'video'))
         ext  = info.get('ext', 'mp4')
         return jsonify({'url': direct_url, 'filename': f'{safe}.{ext}', 'ext': ext})
