@@ -898,42 +898,6 @@ def index():
     return render_template('index.html')
 
 
-@app.route('/api/diag', methods=['POST'])
-def diag():
-    """Temporary: per-backend reachability report for a URL, as seen from this server."""
-    url = (request.get_json() or {}).get('url', 'https://www.youtube.com/watch?v=dQw4w9WgXcQ')
-    report = {}
-    payload = json.dumps({'url': url, 'videoQuality': '720', 'downloadMode': 'auto',
-                          'filenameStyle': 'pretty'}).encode()
-    api_key = os.environ.get('COBALT_API_KEY', '')
-    own = set(_cobalt_own_apis())
-    for base in _cobalt_api_urls():
-        headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
-        if api_key and base in own:
-            headers['Authorization'] = f'Api-Key {api_key}'
-        try:
-            req = urllib.request.Request(f'{base}/', data=payload, headers=headers, method='POST')
-            try:
-                with urllib.request.urlopen(req, timeout=25) as r:
-                    d = json.loads(r.read())
-            except urllib.error.HTTPError as e:
-                d = json.loads(e.read())
-            report[base] = d.get('status') + ' ' + (d.get('error') or {}).get('code', '')
-        except Exception as e:
-            report[base] = f'unreachable: {type(e).__name__}'
-    for base in _yt_fallback_apis():
-        m = _YT_ID_RE.search(url)
-        if not m:
-            continue
-        try:
-            d = _http_get(f'{base}/streams/{m.group(1)}', {'User-Agent': 'Mozilla/5.0'}, timeout=20)
-            n = len([s for s in d.get('videoStreams', []) if not s.get('videoOnly')])
-            report[base] = f'ok, {n} combined streams'
-        except Exception as e:
-            report[base] = f'unreachable: {type(e).__name__} {getattr(e, "code", "")}'
-    return jsonify(report)
-
-
 @app.route('/api/info', methods=['POST'])
 def get_info():
     custom_error = None
