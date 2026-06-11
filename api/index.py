@@ -96,7 +96,8 @@ def _cobalt_own_apis():
 def _cobalt_fallback_apis():
     """Public keyless community instances, tried after our own (override or
     disable via COBALT_FALLBACK_APIS)."""
-    raw = os.environ.get('COBALT_FALLBACK_APIS', 'https://api.co.rooot.gay')
+    raw = os.environ.get('COBALT_FALLBACK_APIS',
+                         'https://co.otomir23.me,https://api.co.rooot.gay')
     return [u.strip().rstrip('/') for u in raw.split(',') if u.strip()]
 
 
