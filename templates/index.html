@@ -840,6 +840,65 @@
     clearStatus();
   }
 
+  // When our server can't reach YouTube (datacenter IP blocks), resolve a
+  // stream directly from the browser — the user's home IP is usually accepted
+  // by the same backup servers that reject ours.
+  async function ytClientResolve(fb, formatId) {
+    const audio = formatId.endsWith('audio');
+    const target = formatId.endsWith('1080') ? 1080 : formatId.endsWith('720') ? 720
+                 : formatId.endsWith('360') ? 360 : 9999;
+    const h = q => { const m = /(\d+)p/.exec(q || ''); return m ? +m[1] : 720; };
+    const tfetch = async u => {
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), 10000);
+      try { return await (await fetch(u, { signal: ctl.signal })).json(); }
+      finally { clearTimeout(t); }
+    };
+    for (const [kind, base] of (fb.sources || [])) {
+      try {
+        if (kind === 'piped') {
+          const d = await tfetch(`${base}/streams/${fb.id}`);
+          if (audio) {
+            const a = (d.audioStreams || []).filter(s => s.url)
+              .sort((x, y) => (y.bitrate || 0) - (x.bitrate || 0));
+            if (a.length) return { url: a[0].url, name: (d.title || 'youtube') + '.m4a' };
+          }
+          const vs = (d.videoStreams || []).filter(s =>
+            s.url && !s.videoOnly && (s.mimeType || '').includes('mp4'));
+          if (vs.length) {
+            const pool = vs.filter(s => h(s.quality) <= target);
+            const best = (pool.length ? pool : vs)
+              .reduce((a, b) => h(b.quality) > h(a.quality) ? b : a);
+            return { url: best.url, name: (d.title || 'youtube') + '.mp4' };
+          }
+        } else {
+          const d = await tfetch(`${base}/api/v1/videos/${fb.id}?local=true`);
+          const abs = u => (u.startsWith('/') ? base + u : u).replace(/^http:\/\//, 'https://');
+          if (audio) {
+            const a = (d.adaptiveFormats || []).filter(s =>
+              s.url && (s.type || '').startsWith('audio/mp4'))
+              .sort((x, y) => (+y.bitrate || 0) - (+x.bitrate || 0));
+            if (a.length) return { url: abs(a[0].url), name: (d.title || 'youtube') + '.m4a' };
+          }
+          const fs = (d.formatStreams || []).filter(s => s.url);
+          if (fs.length) {
+            const pool = fs.filter(s => h(s.qualityLabel) <= target);
+            const best = (pool.length ? pool : fs)
+              .reduce((a, b) => h(b.qualityLabel) > h(a.qualityLabel) ? b : a);
+            return { url: abs(best.url), name: (d.title || 'youtube') + '.mp4' };
+          }
+        }
+      } catch {}
+    }
+    return null;
+  }
+
+  function triggerDownload(url, name) {
+    const a = document.createElement('a');
+    a.href = url; a.download = name; a.target = '_blank'; a.rel = 'noopener';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  }
+
   async function downloadVideo() {
     if (!selFmt || !currentURL) return;
     const btn = document.getElementById('downloadBtn');
@@ -854,15 +913,23 @@
         body: JSON.stringify({ url: currentURL, format_id: selFmt }),
       });
       const data = await res.json();
-      if (!res.ok || data.error) { showErr(data.error || 'Failed to get download link.'); clearStatus(); return; }
+      if (!res.ok || data.error) {
+        if (data.yt_fallback) {
+          setStatus('Main servers are busy — trying backup servers…', 'info');
+          const alt = await ytClientResolve(data.yt_fallback, selFmt);
+          if (alt) {
+            resolvedURL = alt.url; resolvedName = alt.name;
+            triggerDownload(alt.url, alt.name);
+            setStatus('Download started via backup server (quality may be limited).', 'ok');
+            return;
+          }
+        }
+        showErr(data.error || 'Failed to get download link.'); clearStatus(); return;
+      }
 
       resolvedURL = data.url;
       resolvedName = data.filename || 'video.mp4';
-
-      const a = document.createElement('a');
-      a.href = resolvedURL; a.download = resolvedName; a.target = '_blank'; a.rel = 'noopener';
-      document.body.appendChild(a); a.click(); document.body.removeChild(a);
-
+      triggerDownload(resolvedURL, resolvedName);
       setStatus('Download started. If it opens in a new tab, right-click → Save as.', 'ok');
     } catch { showErr('Network error while fetching download link.'); clearStatus(); }
     finally {
