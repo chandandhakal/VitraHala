@@ -333,6 +333,25 @@ def _cobalt_download(url, quality='max', mode='auto'):
             # Cobalt reports errors as HTTP 4xx with a JSON body ({status: error, error: {code}})
             return json.loads(e.read())
 
+    def _serves(result):
+        """A tunnel can open yet stream 0 bytes when the instance's remux fails —
+        check it actually serves data before handing it to the user."""
+        if result.get('status') not in ('tunnel', 'redirect'):
+            return True
+        try:
+            req = urllib.request.Request(result.get('url', ''), headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                              'AppleWebKit/537.36 (KHTML, like Gecko) '
+                              'Chrome/125.0.0.0 Safari/537.36'})
+            with urllib.request.urlopen(req, timeout=12) as r:
+                return bool(r.read(1))
+        except TimeoutError:
+            return True  # slow remux spin-up — give it the benefit of the doubt
+        except Exception as e:
+            if 'timed out' in str(e).lower():
+                return True
+            return False
+
     last = None
     for base in _cobalt_api_urls():
         try:
@@ -341,13 +360,16 @@ def _cobalt_download(url, quality='max', mode='auto'):
             last = e
             continue
         if result.get('status') != 'error':
-            return result
+            if _serves(result):
+                return result
+            last = {'status': 'error', 'error': {'code': 'error.api.fetch.fail'}}
+            continue
         code = (result.get('error') or {}).get('code', '')
         if 'youtube' in code:
             # the HLS client path often evades YouTube's login wall — retry once
             try:
                 retry = _post(base, {**body, 'youtubeHLS': True})
-                if retry.get('status') != 'error':
+                if retry.get('status') != 'error' and _serves(retry):
                     return retry
             except Exception:
                 pass
