@@ -978,6 +978,41 @@ def index():
     return render_template('index.html')
 
 
+@app.route('/api/diag2', methods=['POST'])
+def diag2():
+    """Temporary: exercise every YouTube fallback source from this server."""
+    url = (request.get_json() or {}).get('url', 'https://www.youtube.com/watch?v=9bZkp7q19f0')
+    report = {}
+    try:
+        report['dynamic_apis'] = _yt_dynamic_apis()
+    except Exception as e:
+        report['dynamic_apis'] = f'FAIL {type(e).__name__}: {e}'
+    m = _YT_ID_RE.search(url)
+    vid = m.group(1) if m else ''
+    sources = [('piped', b) for b in _yt_fallback_apis()]
+    try:
+        sources += [tuple(s) for s in _yt_dynamic_apis() if tuple(s) not in sources]
+    except Exception:
+        pass
+    for kind, base in sources[:8]:
+        try:
+            if kind == 'piped':
+                d = _http_get(f'{base}/streams/{vid}', {'User-Agent': 'Mozilla/5.0'}, timeout=20)
+                n = len([s for s in d.get('videoStreams', []) if not s.get('videoOnly')])
+                report[base] = f'piped ok, {n} combined'
+            else:
+                d = _http_get(f'{base}/api/v1/videos/{vid}?local=true',
+                              {'User-Agent': 'Mozilla/5.0'}, timeout=20)
+                report[base] = f'invidious ok, {len(d.get("formatStreams") or [])} combined'
+        except Exception as e:
+            report[base] = f'FAIL {type(e).__name__} {getattr(e, "code", "")}: {str(e)[:80]}'
+    try:
+        report['alt_resolve'] = _youtube_alt_resolve(url, 'cobalt_720')
+    except Exception as e:
+        report['alt_resolve'] = f'FAIL {type(e).__name__}: {str(e)[:120]}'
+    return jsonify(report)
+
+
 @app.route('/api/info', methods=['POST'])
 def get_info():
     custom_error = None
