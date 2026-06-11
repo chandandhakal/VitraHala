@@ -334,23 +334,21 @@ def _cobalt_download(url, quality='max', mode='auto'):
             return json.loads(e.read())
 
     def _serves(result):
-        """A tunnel can open yet stream 0 bytes when the instance's remux fails —
-        check it actually serves data before handing it to the user."""
-        if result.get('status') not in ('tunnel', 'redirect'):
+        """A tunnel can open with HTTP 200 yet stream 0 bytes when the instance's
+        remux fails — that immediate-EOF case is the ONLY one we reject. Errors
+        (403 etc.) seen from our datacenter IP often don't apply to the user's
+        browser, so they get the benefit of the doubt."""
+        if result.get('status') != 'tunnel':
             return True
         try:
             req = urllib.request.Request(result.get('url', ''), headers={
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                               'AppleWebKit/537.36 (KHTML, like Gecko) '
                               'Chrome/125.0.0.0 Safari/537.36'})
-            with urllib.request.urlopen(req, timeout=12) as r:
+            with urllib.request.urlopen(req, timeout=10) as r:
                 return bool(r.read(1))
-        except TimeoutError:
-            return True  # slow remux spin-up — give it the benefit of the doubt
-        except Exception as e:
-            if 'timed out' in str(e).lower():
-                return True
-            return False
+        except Exception:
+            return True
 
     last = None
     for base in _cobalt_api_urls():
